@@ -1,0 +1,13 @@
+﻿/InventoryService/bin
+/CoordinationService/bin
+/PaymentService/bin
+/OrderService/bin
+
+/InventoryService/obj
+/CoordinationService/obj
+/PaymentService/obj
+/OrderService/obj
+
+aws-logger-errors.txt
+
+.idea/

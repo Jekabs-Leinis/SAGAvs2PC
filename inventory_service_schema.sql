@@ -1,0 +1,6 @@
+CREATE TABLE "Inventory" (
+    "ProductID" SERIAL PRIMARY KEY,
+    "StockQuantity" INTEGER NOT NULL DEFAULT 0,
+    "ReservedQuantity" INTEGER NOT NULL DEFAULT 0,
+    "Status" VARCHAR(50) NOT NULL DEFAULT 'NONE'
+);

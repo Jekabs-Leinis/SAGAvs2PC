@@ -1,0 +1,8 @@
+CREATE TABLE "Orders" (
+    "OrderID" SERIAL PRIMARY KEY,
+    "UserID" INTEGER NOT NULL,
+    "ProductID" INTEGER NOT NULL,
+    "Quantity" INTEGER NOT NULL,
+    "Amount" DECIMAL(10, 2) NOT NULL,
+    "OrderStatus" VARCHAR(50) NOT NULL DEFAULT 'PENDING'
+); 

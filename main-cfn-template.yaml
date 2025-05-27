@@ -1,0 +1,723 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Main CloudFormation template for deploying the SagaVs2PC microservices application.
+  This template creates two public subnets to meet RDS AZ requirements, but deploys ECS tasks
+  to a single subnet for testing simplicity.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Description: A name for the environment (e.g., SagaVs2PC-Experiment-Dev, SagaVs2PC-SAGA-Test). Used for naming and tagging.
+    Default: SagaVs2PC-Experiment
+
+  OrderServiceImageTag:
+    Type: String
+    Description: Docker image tag for OrderService.
+    Default: latest
+  PaymentServiceImageTag:
+    Type: String
+    Description: Docker image tag for PaymentService.
+    Default: latest
+  InventoryServiceImageTag:
+    Type: String
+    Description: Docker image tag for InventoryService.
+    Default: latest
+  CoordinationServiceImageTag:
+    Type: String
+    Description: Docker image tag for CoordinationService.
+    Default: latest
+
+  AwsAccountId:
+    Type: String
+    Description: Your AWS Account ID (used for ECR image URIs).
+    Default: [REDACTED]
+
+  AwsRegion:
+    Type: String
+    Description: The AWS Region where resources will be deployed (used for ECR image URIs).
+    Default: eu-north-1
+
+  # RDS Parameters
+  OrderServiceDatabaseName:
+    Type: String
+    Default: OrderServiceDB
+    Description: The name of the PostgreSQL database for OrderService.
+  PaymentServiceDatabaseName:
+    Type: String
+    Default: PaymentServiceDB
+    Description: The name of the PostgreSQL database for PaymentService.
+  InventoryServiceDatabaseName:
+    Type: String
+    Default: InventoryServiceDB
+    Description: The name of the PostgreSQL database for InventoryService.
+  CoordinationServiceDatabaseName:
+    Type: String
+    Default: CoordinationServiceDB
+    Description: The name of the PostgreSQL database for CoordinationService.
+
+  DatabaseUsername:
+    Type: String
+    Default: dbadmin
+    Description: The username for the database administrator.
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    Description: The password for the database administrator.
+    MinLength: 8
+    AllowedPattern: "[a-zA-Z0-9!@#$%^&*()_+-=]+"
+    ConstraintDescription: Must contain at least 8 characters and can include uppercase, lowercase, numbers, and symbols !@#$%^&*()_+-=
+
+  # VPC and Networking Parameters
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+  AppSubnet1Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for the primary application Subnet in AZ1.
+  AppSubnet2Cidr:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for the secondary Subnet in AZ2 (for RDS).
+
+  # ECS Service Parameters
+  ECSServiceDesiredCount:
+    Type: Number
+    Default: 1
+    Description: Desired number of tasks for each ECS service.
+  ECSServiceMinCount:
+    Type: Number
+    Default: 1
+    Description: Minimum number of tasks for ECS service auto-scaling.
+  ECSServiceMaxCount:
+    Type: Number
+    Default: 20
+    Description: Maximum number of tasks for ECS service auto-scaling.
+  ECSServiceCpu:
+    Type: Number
+    Default: 256 # 0.25 vCPU
+    Description: CPU units for ECS Fargate tasks.
+  ECSServiceMemory:
+    Type: Number
+    Default: 512 # 0.5 GB
+    Description: Memory in MiB for ECS Fargate tasks.
+
+  CoordinationServiceCpu:
+    Type: Number
+    Default: 1024 # 0.5 vCPU, increased for CoordinationService
+    Description: CPU units for CoordinationService Fargate tasks.
+  CoordinationServiceMemory:
+    Type: Number
+    Default: 2048 # 1 GB, increased for CoordinationService
+    Description: Memory in MiB for CoordinationService Fargate tasks.
+
+Resources:
+  # --- VPC and Networking Resources ---
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-VPC"
+
+  AppSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref AppSubnet1Cidr
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-AppSubnet1"
+
+  AppSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref AppSubnet2Cidr
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-AppSubnet2"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-IGW"
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-PublicRouteTable"
+  
+  PublicRouteToIGW:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  AppSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  AppSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- Security Groups (Defined early for clarity) ---
+  ALBInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow HTTP traffic to ALB"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ALB-SG"
+
+  ECSServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for ECS Fargate tasks"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-ECS-Tasks-SG"
+
+  RDSInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Allow DB connections from ECS tasks"
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-RDS-SG"
+
+  # --- RDS Database (Aurora PostgreSQL) ---
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnet group for Aurora PostgreSQL cluster"
+      SubnetIds:
+        - !Ref AppSubnet1
+        - !Ref AppSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-RDS-SubnetGroup"
+
+  DBClusterParameterGroupCustom:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: "Custom cluster parameter group with increased max_prepared_transactions"
+      Family: aurora-postgresql15 # Ensure this matches your EngineVersion major.minor
+      Parameters:
+        max_prepared_transactions: "100"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-CustomClusterParams"
+
+  AuroraDBCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '15.3'
+      Port: 5432
+      DatabaseName: !Ref OrderServiceDatabaseName # Initial database, others created logically
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DBClusterParameterGroupName: !Ref DBClusterParameterGroupCustom # Use custom parameter group
+      VpcSecurityGroupIds:
+        - !Ref RDSInstanceSecurityGroup
+      StorageEncrypted: false
+      DeletionProtection: false
+      Tags:
+        - Key: Project
+          Value: SagaVs2PC
+
+  OrderServiceDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-order-db-instance"
+      DBClusterIdentifier: !Ref AuroraDBCluster
+      DBInstanceClass: db.t3.medium
+      Engine: aurora-postgresql
+      PubliclyAccessible: true
+      Tags:
+        - Key: Project
+          Value: SagaVs2PC
+        - Key: Service
+          Value: OrderService
+
+  PaymentServiceDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-payment-db-instance"
+      DBClusterIdentifier: !Ref AuroraDBCluster
+      DBInstanceClass: db.t3.medium
+      Engine: aurora-postgresql
+      PubliclyAccessible: true # For simplicity in test environment
+      Tags:
+        - Key: Project
+          Value: SagaVs2PC
+        - Key: Service
+          Value: PaymentService
+
+  InventoryServiceDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-inventory-db-instance"
+      DBClusterIdentifier: !Ref AuroraDBCluster
+      DBInstanceClass: db.t3.medium
+      Engine: aurora-postgresql
+      PubliclyAccessible: true # For simplicity in test environment
+      Tags:
+        - Key: Project
+          Value: SagaVs2PC
+        - Key: Service
+          Value: InventoryService
+
+  CoordinationServiceDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-coordination-db-instance"
+      DBClusterIdentifier: !Ref AuroraDBCluster
+      DBInstanceClass: db.t3.medium
+      Engine: aurora-postgresql
+      PubliclyAccessible: true # For simplicity in test environment
+      Tags:
+        - Key: Project
+          Value: SagaVs2PC
+        - Key: Service
+          Value: CoordinationService
+
+  # --- SSM Parameters for DB Connection ---
+  OrderServiceDBConnectionStringParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/OrderService/Database/ConnectionString"
+      Type: String
+      Value: !Sub "Host=${AuroraDBCluster.Endpoint.Address};Port=${AuroraDBCluster.Endpoint.Port};Database=${OrderServiceDatabaseName};Username=${DatabaseUsername};Password=${DatabasePassword};"
+      Description: "Aurora PostgreSQL connection string for OrderService"
+
+  PaymentServiceDBConnectionStringParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/PaymentService/Database/ConnectionString"
+      Type: String
+      Value: !Sub "Host=${AuroraDBCluster.Endpoint.Address};Port=${AuroraDBCluster.Endpoint.Port};Database=${PaymentServiceDatabaseName};Username=${DatabaseUsername};Password=${DatabasePassword};"
+      Description: "Aurora PostgreSQL connection string for PaymentService"
+
+  InventoryServiceDBConnectionStringParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/InventoryService/Database/ConnectionString"
+      Type: String
+      Value: !Sub "Host=${AuroraDBCluster.Endpoint.Address};Port=${AuroraDBCluster.Endpoint.Port};Database=${InventoryServiceDatabaseName};Username=${DatabaseUsername};Password=${DatabasePassword};"
+      Description: "Aurora PostgreSQL connection string for InventoryService"
+
+  CoordinationServiceDBConnectionStringParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${EnvironmentName}/CoordinationService/Database/ConnectionString"
+      Type: String
+      Value: !Sub "Host=${AuroraDBCluster.Endpoint.Address};Port=${AuroraDBCluster.Endpoint.Port};Database=${CoordinationServiceDatabaseName};Username=${DatabaseUsername};Password=${DatabasePassword};"
+      Description: "Aurora PostgreSQL connection string for CoordinationService"
+
+  # --- ECS Cluster & IAM Roles ---
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${EnvironmentName}-Cluster"
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-ECSTaskExecutionRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: !Sub "${EnvironmentName}-SSMAccessPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ssm:GetParameters"
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${EnvironmentName}/*/Database/ConnectionString"
+
+  # --- Application Load Balancer ---
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-ALB"
+      Subnets:
+        - !Ref AppSubnet1
+        - !Ref AppSubnet2
+      SecurityGroups:
+        - !Ref ALBInstanceSecurityGroup
+      Scheme: internet-facing
+      Type: application
+
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 8080
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            ContentType: text/plain
+            MessageBody: "No service matched for this path."
+            StatusCode: "404"
+
+  # --- Target Groups ---
+  OrderServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-OrderService-TG"
+      VpcId: !Ref VPC
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: "/Orders/health"
+      Matcher: { HttpCode: "200" }
+
+  PaymentServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-PaymentService-TG"
+      VpcId: !Ref VPC
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: "/Payments/health"
+      Matcher: { HttpCode: "200" }
+
+  InventoryServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-InventoryService-TG"
+      VpcId: !Ref VPC
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: "/Inventory/health"
+      Matcher: { HttpCode: "200" }
+
+  CoordinationServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-CoordinationService-TG"
+      VpcId: !Ref VPC
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckPath: "/Transaction/health"
+      Matcher: { HttpCode: "200" }
+
+  # --- ECS Task Definitions and Services ---
+  OrderServiceLogGroup: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/ecs/${EnvironmentName}/OrderService", RetentionInDays: 7 } }
+  PaymentServiceLogGroup: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/ecs/${EnvironmentName}/PaymentService", RetentionInDays: 7 } }
+  InventoryServiceLogGroup: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/ecs/${EnvironmentName}/InventoryService", RetentionInDays: 7 } }
+  CoordinationServiceLogGroup: { Type: AWS::Logs::LogGroup, Properties: { LogGroupName: !Sub "/ecs/${EnvironmentName}/CoordinationService", RetentionInDays: 7 } }
+
+  # --- OrderService ---
+  OrderServiceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${EnvironmentName}-OrderService"
+      Cpu: !Ref ECSServiceCpu
+      Memory: !Ref ECSServiceMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [ "FARGATE" ]
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      ContainerDefinitions:
+        - Name: orderservice-container
+          Image: !Sub "${AwsAccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/orderservice:${OrderServiceImageTag}"
+          PortMappings: [ { ContainerPort: 8080, Protocol: tcp } ]
+          LogConfiguration: { LogDriver: awslogs, Options: { awslogs-group: !Ref OrderServiceLogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: ecs } }
+          Secrets: [ { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Ref OrderServiceDBConnectionStringParameter } ]
+
+  OrderServiceECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${EnvironmentName}-OrderService"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref OrderServiceTaskDefinition
+      DesiredCount: !Ref ECSServiceDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: [ !Ref AppSubnet1 ]
+          SecurityGroups: [ !Ref ECSServiceSecurityGroup ]
+          AssignPublicIp: ENABLED
+      LoadBalancers: [ { TargetGroupArn: !Ref OrderServiceTargetGroup, ContainerName: "orderservice-container", ContainerPort: 8080 } ]
+      HealthCheckGracePeriodSeconds: 60
+    DependsOn: OrderServiceListenerRule
+
+  OrderServiceListenerRule: { Type: AWS::ElasticLoadBalancingV2::ListenerRule, Properties: { ListenerArn: !Ref ALBListenerHTTP, Priority: 10, Actions: [ { Type: forward, TargetGroupArn: !Ref OrderServiceTargetGroup } ], Conditions: [ { Field: path-pattern, Values: [ "/orders/*" ] } ] } }
+
+  OrderServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref ECSServiceMaxCount
+      MinCapacity: !Ref ECSServiceMinCount
+      ResourceId: !Sub "service/${EnvironmentName}-Cluster/${OrderServiceECSService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+    DependsOn: OrderServiceECSService
+
+  OrderServiceCPUScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${EnvironmentName}-OrderService-CPUScaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref OrderServiceScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50.0
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+  # --- PaymentService ---
+  PaymentServiceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${EnvironmentName}-PaymentService"
+      Cpu: !Ref ECSServiceCpu
+      Memory: !Ref ECSServiceMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [ "FARGATE" ]
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      ContainerDefinitions:
+        - Name: paymentservice-container
+          Image: !Sub "${AwsAccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/paymentservice:${PaymentServiceImageTag}"
+          PortMappings: [ { ContainerPort: 8080, Protocol: tcp } ]
+          LogConfiguration: { LogDriver: awslogs, Options: { awslogs-group: !Ref PaymentServiceLogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: ecs } }
+          Secrets: [ { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Ref PaymentServiceDBConnectionStringParameter } ]
+
+  PaymentServiceECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${EnvironmentName}-PaymentService"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref PaymentServiceTaskDefinition
+      DesiredCount: !Ref ECSServiceDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration: { AwsvpcConfiguration: { Subnets: [ !Ref AppSubnet1 ], SecurityGroups: [ !Ref ECSServiceSecurityGroup ], AssignPublicIp: ENABLED } }
+      LoadBalancers: [ { TargetGroupArn: !Ref PaymentServiceTargetGroup, ContainerName: "paymentservice-container", ContainerPort: 8080 } ]
+      HealthCheckGracePeriodSeconds: 60
+    DependsOn: PaymentServiceListenerRule
+
+  PaymentServiceListenerRule: { Type: AWS::ElasticLoadBalancingV2::ListenerRule, Properties: { ListenerArn: !Ref ALBListenerHTTP, Priority: 20, Actions: [ { Type: forward, TargetGroupArn: !Ref PaymentServiceTargetGroup } ], Conditions: [ { Field: path-pattern, Values: [ "/payments/*" ] } ] } }
+
+  PaymentServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref ECSServiceMaxCount
+      MinCapacity: !Ref ECSServiceMinCount
+      ResourceId: !Sub "service/${EnvironmentName}-Cluster/${PaymentServiceECSService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+    DependsOn: PaymentServiceECSService
+
+  PaymentServiceCPUScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${EnvironmentName}-PaymentService-CPUScaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref PaymentServiceScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50.0
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+  # --- InventoryService ---
+  InventoryServiceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${EnvironmentName}-InventoryService"
+      Cpu: !Ref ECSServiceCpu
+      Memory: !Ref ECSServiceMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [ "FARGATE" ]
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      ContainerDefinitions:
+        - Name: inventoryservice-container
+          Image: !Sub "${AwsAccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/inventoryservice:${InventoryServiceImageTag}"
+          PortMappings: [ { ContainerPort: 8080, Protocol: tcp } ]
+          LogConfiguration: { LogDriver: awslogs, Options: { awslogs-group: !Ref InventoryServiceLogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: ecs } }
+          Secrets: [ { Name: ConnectionStrings__DefaultConnection, ValueFrom: !Ref InventoryServiceDBConnectionStringParameter } ]
+
+  InventoryServiceECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${EnvironmentName}-InventoryService"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref InventoryServiceTaskDefinition
+      DesiredCount: !Ref ECSServiceDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration: { AwsvpcConfiguration: { Subnets: [ !Ref AppSubnet1 ], SecurityGroups: [ !Ref ECSServiceSecurityGroup ], AssignPublicIp: ENABLED } }
+      LoadBalancers: [ { TargetGroupArn: !Ref InventoryServiceTargetGroup, ContainerName: "inventoryservice-container", ContainerPort: 8080 } ]
+      HealthCheckGracePeriodSeconds: 60
+    DependsOn: InventoryServiceListenerRule
+
+  InventoryServiceListenerRule: { Type: AWS::ElasticLoadBalancingV2::ListenerRule, Properties: { ListenerArn: !Ref ALBListenerHTTP, Priority: 30, Actions: [ { Type: forward, TargetGroupArn: !Ref InventoryServiceTargetGroup } ], Conditions: [ { Field: path-pattern, Values: [ "/inventory/*" ] } ] } }
+
+  InventoryServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref ECSServiceMaxCount
+      MinCapacity: !Ref ECSServiceMinCount
+      ResourceId: !Sub "service/${EnvironmentName}-Cluster/${InventoryServiceECSService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+    DependsOn: InventoryServiceECSService
+
+  InventoryServiceCPUScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${EnvironmentName}-InventoryService-CPUScaling"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref InventoryServiceScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50.0
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+
+  # --- CoordinationService ---
+  CoordinationServiceTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${EnvironmentName}-CoordinationService"
+      Cpu: !Ref CoordinationServiceCpu
+      Memory: !Ref CoordinationServiceMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [ "FARGATE" ]
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      ContainerDefinitions:
+        - Name: coordinationservice-container
+          Image: !Sub "${AwsAccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/coordinationservice:${CoordinationServiceImageTag}"
+          PortMappings: [ { ContainerPort: 8080, Protocol: tcp } ]
+          LogConfiguration: { LogDriver: awslogs, Options: { awslogs-group: !Ref CoordinationServiceLogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: ecs } }
+          Environment:
+            - Name: ServiceEndpoints__OrderService
+              Value: !Sub "http://${ApplicationLoadBalancer.DNSName}:8080"
+            - Name: ServiceEndpoints__PaymentService
+              Value: !Sub "http://${ApplicationLoadBalancer.DNSName}:8080"
+            - Name: ServiceEndpoints__InventoryService
+              Value: !Sub "http://${ApplicationLoadBalancer.DNSName}:8080"
+          Secrets:
+            - Name: ConnectionStrings__DefaultConnection
+              ValueFrom: !Ref CoordinationServiceDBConnectionStringParameter
+
+  CoordinationServiceECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${EnvironmentName}-CoordinationService"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref CoordinationServiceTaskDefinition
+      DesiredCount: !Ref ECSServiceDesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration: { AwsvpcConfiguration: { Subnets: [ !Ref AppSubnet1 ], SecurityGroups: [ !Ref ECSServiceSecurityGroup ], AssignPublicIp: ENABLED } }
+      LoadBalancers: [ { TargetGroupArn: !Ref CoordinationServiceTargetGroup, ContainerName: "coordinationservice-container", ContainerPort: 8080 } ]
+      HealthCheckGracePeriodSeconds: 60
+    DependsOn: CoordinationServiceListenerRule
+
+  CoordinationServiceListenerRule: { Type: AWS::ElasticLoadBalancingV2::ListenerRule, Properties: { ListenerArn: !Ref ALBListenerHTTP, Priority: 40, Actions: [ { Type: forward, TargetGroupArn: !Ref CoordinationServiceTargetGroup } ], Conditions: [ { Field: path-pattern, Values: [ "/transaction/*" ] } ] } }
+
+Outputs:
+  VPCId:
+    Description: The ID of the VPC
+    Value: !Ref VPC
+  AppSubnetIds:
+    Description: Comma-delimited list of the application subnet IDs
+    Value: !Join [ ",", [ !Ref AppSubnet1, !Ref AppSubnet2 ] ]
+  PrimaryAppSubnetId:
+    Description: The ID of the primary subnet where services are deployed. Use this for your EC2 instances.
+    Value: !Ref AppSubnet1
+  ALBDNSName:
+    Description: DNS Name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+  ApplicationURL:
+    Description: Base URL for the Application Load Balancer
+    Value: !Sub "http://${ApplicationLoadBalancer.DNSName}:8080"
+  OrderServiceDBEndpoint:
+    Description: Endpoint for the OrderService Database
+    Value: !GetAtt AuroraDBCluster.Endpoint.Address
+  OrderServiceDBPort:
+    Description: Port for the OrderService Database
+    Value: !GetAtt AuroraDBCluster.Endpoint.Port
+  OrderServiceDBNameOutput:
+    Description: Database name for OrderService
+    Value: !Ref OrderServiceDatabaseName
+  PaymentServiceDBNameOutput:
+    Description: Database name for PaymentService
+    Value: !Ref PaymentServiceDatabaseName
+  InventoryServiceDBNameOutput:
+    Description: Database name for InventoryService
+    Value: !Ref InventoryServiceDatabaseName
+  CoordinationServiceDBNameOutput:
+    Description: Database name for CoordinationService
+    Value: !Ref CoordinationServiceDatabaseName
+  DatabaseClusterEndpoint:
+    Description: Endpoint for the Aurora DB Cluster
+    Value: !GetAtt AuroraDBCluster.Endpoint.Address
+  DatabaseClusterPort:
+    Description: Port for the Aurora DB Cluster
+    Value: !GetAtt AuroraDBCluster.Endpoint.Port
